@@ -165,14 +165,65 @@ template<class F> void parallel(size_t tasks, int workers, F fn) {
     if(error) std::rethrow_exception(error);
 }
 
+inline uint64_t text_hash(Text s) {
+    if(s.size()<8 || s.size()>16) return std::hash<Text>{}(s);
+    uint64_t lo,hi;
+    std::memcpy(&lo,s.data(),8);
+    std::memcpy(&hi,s.data()+s.size()-8,8);
+    uint64_t v=(lo*0x9e3779b185ebca87ULL) ^ (hi*0xc2b2ae3d27d4eb4fULL) ^ s.size();
+    v^=v>>33;
+    v*=0xff51afd7ed558ccdULL;
+    return v^(v>>32);
+}
+
+// Flat open addressing keeps lookups contiguous. Hash collisions always compare full text.
+struct NameIndex {
+    struct Entry { Text key; uint64_t hash=0; int value=0; };
+    std::vector<Entry> slots=std::vector<Entry>(1024);
+    size_t used=0;
+    size_t locate(Text key,uint64_t h) const {
+        size_t mask=slots.size()-1;
+        size_t i=h & mask;
+        while(!slots[i].key.empty() && (slots[i].hash!=h || slots[i].key!=key))
+            i=(i+1)&mask;
+        return i;
+    }
+    void expand() {
+        auto old=std::move(slots);
+        slots.assign(old.size()*2,Entry{});
+        for(auto& e:old) if(!e.key.empty()) slots[locate(e.key,e.hash)]=e;
+    }
+    std::pair<int,bool> insert(Text key,int proposed) {
+        if(used*10>=slots.size()*7) expand();
+        auto h=text_hash(key);
+        auto& e=slots[locate(key,h)];
+        if(!e.key.empty()) return {e.value,false};
+        e={key,h,proposed};
+        ++used;
+        return {proposed,true};
+    }
+};
+
+struct Person {
+    Text name;
+    uint64_t order;
+    bool operator==(const Person& other) const {
+        return order==other.order && (!(order>>63) || name==other.name);
+    }
+    bool operator!=(const Person& other) const { return !(*this==other); }
+    bool operator<(const Person& other) const {
+        if(order!=other.order) return order<other.order;
+        return (order>>63) && name<other.name;
+    }
+};
 struct People {
-    std::unordered_map<Text,int> index;
+    NameIndex index;
     std::vector<int> parents, sizes;
     std::vector<Text> names;
     int id(Text s) {
-        auto [it,added]=index.emplace(s,parents.size());
-        if(added) { parents.push_back(it->second); sizes.push_back(1); names.push_back(s); }
-        return it->second;
+        auto [value,added]=index.insert(s,parents.size());
+        if(added) { parents.push_back(value); sizes.push_back(1); names.push_back(s); }
+        return value;
     }
     int root(int a) {
         while(a!=parents[a]) { parents[a]=parents[parents[a]]; a=parents[a]; }
@@ -185,9 +236,11 @@ struct People {
         parents[b]=a; sizes[a]+=sizes[b];
         names[a]=std::min(names[a],names[b]);
     }
-    void finish() { for(auto& pair:index) pair.second=root(pair.second); }
-    Text operator()(Text s) const {
-        auto it=index.find(s);
-        return it==index.end() ? s : names[it->second];
+    void finish() { for(auto& e:index.slots) if(!e.key.empty()) e.value=root(e.value); }
+    Person operator()(Text s) const {
+        uint64_t h=text_hash(s);
+        const auto& e=index.slots[index.locate(s,h)];
+        if(e.key.empty()) return {s,h|(uint64_t(1)<<63)};
+        return {names[e.value],static_cast<uint64_t>(e.value)};
     }
 };

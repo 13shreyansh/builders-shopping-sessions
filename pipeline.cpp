@@ -3,7 +3,7 @@
 
 namespace {
 constexpr int buckets=64;
-unsigned bucket(Text key) { return std::hash<Text>{}(key) % buckets; }
+unsigned bucket(Person who) { return who.order % buckets; }
 template<class T> using Parts=std::array<std::vector<T>,buckets>;
 template<class T> std::vector<T> collect(std::vector<Parts<T>>& parts, int index) {
     size_t n=0;
@@ -76,8 +76,8 @@ Text first_field(Text line) {
     if(id.size()>=2 && id.front()=='"' && id.back()=='"') return id.substr(1,id.size()-2);
     return id;
 }
-struct Event { Text person; I64 ts; int cents,category; };
-struct Click { Text person; I64 ts; Text id; int campaign; };
+struct Event { Person person; I64 ts; int cents,category; };
+struct Click { Person person; I64 ts; Text id; int campaign; };
 
 void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
     if(f[1].empty() || f[5].empty()) return;
@@ -91,13 +91,13 @@ void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window&
         auto it=dims.products.find(f[5]);
         if(it!=dims.products.end()) category=it->second;
     } else if(f[4]!="view" && f[4]!="cart") return;
-    Text who=dims.people(f[1]);
+    Person who=dims.people(f[1]);
     dst[bucket(who)].push_back({who,ts,cents,category});
 }
 
 void process_person(const Event* events,const Event* end,const Click* click,const Click* click_end,
                     const Dimensions& dims,Campaigns& totals,std::vector<UserRow>& users) {
-    const Text person=events->person;
+    const Text person=events->person.name;
     std::unordered_map<int,int> active;
     const Click* expire=click;
     int latest=0;
@@ -172,7 +172,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
         lines(event_files.chunks[i],[&](Text line) {
             Text id=first_field(line);
             if(id.empty()) return;
-            auto hash=std::hash<Text>{}(id);
+            auto hash=text_hash(id);
             raw[worker][hash%buckets].push_back({hash,line});
         });
     });
@@ -206,7 +206,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
         lines(event_files.chunks[i],[&](Text line) {
             std::array<Text,7> f;
             if(!fields(line,f) || f[0].empty()) return;
-            auto hash=std::hash<Text>{}(f[0]);
+            auto hash=text_hash(f[0]);
             const auto& r=repeats[hash%buckets];
             if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
             keep_event(f,dims,win,events[worker]);
@@ -221,7 +221,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
             I64 ts=timestamp(f[3]);
             auto it=dims.campaign_ids.find(f[2]);
             if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
-            Text who=dims.people(f[1]);
+            Person who=dims.people(f[1]);
             clicks[worker][bucket(who)].push_back({who,ts,f[0],it->second});
         });
     });
