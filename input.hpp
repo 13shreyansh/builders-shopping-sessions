@@ -16,6 +16,11 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -90,6 +95,65 @@ template<size_t N> bool fields(Text line, std::array<Text,N>& out) {
     }
     return true;
 }
+
+#if defined(__aarch64__) || defined(__SSE2__)
+struct Delimiters { unsigned commas, quotes; };
+#if defined(__aarch64__)
+inline unsigned mask_lanes(uint8x16_t lanes) {
+    const uint8_t bits[]={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
+    auto m=vandq_u8(lanes,vld1q_u8(bits));
+    return vaddv_u8(vget_low_u8(m)) | (unsigned(vaddv_u8(vget_high_u8(m)))<<8);
+}
+#endif
+inline Delimiters delimiters(const char* p) {
+#if defined(__aarch64__)
+    auto v=vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+    return {mask_lanes(vceqq_u8(v,vdupq_n_u8(','))),mask_lanes(vceqq_u8(v,vdupq_n_u8('"')))};
+#else
+    auto v=_mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    return {unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(v,_mm_set1_epi8(',')))),
+            unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(v,_mm_set1_epi8('"'))))};
+#endif
+}
+template<size_t N> bool scan_fields(Text line,std::array<Text,N>& out) {
+    // Long and short lines retain exactly the same scalar dialect.
+    if(line.size()<16 || line.size()>192) return fields(line,out);
+    std::array<unsigned,N> ends;
+    unsigned count=0,quotes=0;
+    auto scan=[&](unsigned i,unsigned skip) {
+        auto mask=delimiters(line.data()+i);
+        mask.commas &= (0xffffu<<skip);
+        quotes+=__builtin_popcount(mask.quotes & (0xffffu<<skip));
+        while(mask.commas) {
+            if(count>=N-1) return false;
+            ends[count++]=i+__builtin_ctz(mask.commas);
+            mask.commas&=mask.commas-1;
+        }
+        return true;
+    };
+    unsigned pos=0;
+    for(;pos+16<=line.size();pos+=16) if(!scan(pos,0)) return false;
+    if(pos<line.size() && !scan(line.size()-16,16-(line.size()-pos))) return false;
+    if(count!=N-1) return false;
+    ends[N-1]=line.size();
+    unsigned begin=0,wrapped=0;
+    for(size_t i=0;i<N;++i) {
+        unsigned end=ends[i];
+        Text value=line.substr(begin,end-begin);
+        if(!value.empty() && value.front()=='"') {
+            if(value.size()<2 || value.back()!='"') return false;
+            value.remove_prefix(1);
+            value.remove_suffix(1);
+            wrapped+=2;
+        }
+        out[i]=value;
+        begin=end+1;
+    }
+    return wrapped==quotes;
+}
+#else
+template<size_t N> bool scan_fields(Text line,std::array<Text,N>& out) { return fields(line,out); }
+#endif
 
 inline int digits(Text s, int pos, int len) {
     int value=0;

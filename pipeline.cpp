@@ -28,7 +28,7 @@ struct Dimensions {
         std::unordered_map<Text,int> cat{{"unknown",0}};
         for(Text chunk:files.chunks) lines(chunk,[&](Text line) {
             std::array<Text,2> f;
-            if(!fields(line,f)) return;
+            if(!scan_fields(line,f)) return;
             auto [it,added]=cat.emplace(f[1],categories.size());
             if(added) categories.push_back(f[1]);
             products.emplace(f[0],it->second);
@@ -37,7 +37,7 @@ struct Dimensions {
         files.add(root/"campaigns.csv");
         for(Text chunk:files.chunks) lines(chunk,[&](Text line) {
             std::array<Text,2> f;
-            if(!fields(line,f)) return;
+            if(!scan_fields(line,f)) return;
             campaign_ids.emplace(f[0],campaigns.size());
             campaigns.push_back({f[0],f[1]});
         });
@@ -45,7 +45,7 @@ struct Dimensions {
         files.folder(root/"links");
         for(Text chunk:files.chunks) lines(chunk,[&](Text line) {
             std::array<Text,2> f;
-            if(fields(line,f) && !f[0].empty() && !f[1].empty()) people.join(f[0],f[1]);
+            if(scan_fields(line,f) && !f[0].empty() && !f[1].empty()) people.join(f[0],f[1]);
         });
         people.finish();
     }
@@ -193,7 +193,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
             for(const auto& row:src[b]) {
                 if(!r.possible.has(row.hash)) continue;
                 std::array<Text,7> f;
-                if(!fields(row.line,f) || f[0].empty()) continue;
+                if(!scan_fields(row.line,f) || f[0].empty()) continue;
                 auto [it,added]=r.winners.emplace(f[0],Winner{f[3],row.line.data()});
                 if(!added && f[3]<it->second.ingest) it->second={f[3],row.line.data()};
             }
@@ -205,7 +205,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
     parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
         lines(event_files.chunks[i],[&](Text line) {
             std::array<Text,7> f;
-            if(!fields(line,f) || f[0].empty()) return;
+            if(!scan_fields(line,f) || f[0].empty()) return;
             auto hash=text_hash(f[0]);
             const auto& r=repeats[hash%buckets];
             if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
@@ -217,7 +217,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
     parallel(click_files.chunks.size(),threads,[&](size_t i,int worker) {
         lines(click_files.chunks[i],[&](Text line) {
             std::array<Text,4> f;
-            if(!fields(line,f) || f[0].empty() || f[1].empty()) return;
+            if(!scan_fields(line,f) || f[0].empty() || f[1].empty()) return;
             I64 ts=timestamp(f[3]);
             auto it=dims.campaign_ids.find(f[2]);
             if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
