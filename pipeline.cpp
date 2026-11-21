@@ -50,13 +50,36 @@ struct Dimensions {
         people.finish();
     }
 };
-struct Raw { Text id,ingest,line; };
+// A Bloom filter only routes potential repeats to the exact winner map.
+struct Fingerprints {
+    std::vector<uint64_t> words;
+    void size_for(size_t n) {
+        size_t blocks=1;
+        while(blocks<n/2) blocks*=2;
+        words.assign(blocks,0);
+    }
+    size_t index(uint64_t hash) const { return (hash>>6)&(words.size()-1); }
+    static uint64_t mask(uint64_t hash) {
+        return (uint64_t(1)<<(hash>>58)) | (uint64_t(1)<<((hash>>50)&63));
+    }
+    bool has(uint64_t hash) const { return (words[index(hash)]&mask(hash))==mask(hash); }
+    void add(uint64_t hash) { words[index(hash)]|=mask(hash); }
+};
+struct Raw { uint64_t hash; Text line; };
+struct Winner { Text ingest; const char* row; };
+struct Repeats {
+    Fingerprints possible;
+    std::unordered_map<Text,Winner> winners;
+};
+Text first_field(Text line) {
+    Text id=line.substr(0,line.find(','));
+    if(id.size()>=2 && id.front()=='"' && id.back()=='"') return id.substr(1,id.size()-2);
+    return id;
+}
 struct Event { Text person; I64 ts; int cents,category; };
 struct Click { Text person; I64 ts; Text id; int campaign; };
 
-void keep_event(const Raw& row,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
-    std::array<Text,7> f;
-    if(!fields(row.line,f)) throw std::runtime_error("invalid accepted CSV row");
+void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
     if(f[1].empty() || f[5].empty()) return;
     I64 ts=timestamp(f[2]);
     if(ts<win.start || ts>=win.end || timestamp(f[3])-ts>day_ms) return;
@@ -147,27 +170,49 @@ void run(const fs::path& data,const fs::path& out,int threads) {
     std::vector<Parts<Raw>> raw(threads);
     parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
         lines(event_files.chunks[i],[&](Text line) {
-            std::array<Text,7> f;
-            if(fields(line,f) && !f[0].empty())
-                raw[worker][bucket(f[0])].push_back({f[0],f[3],line});
+            Text id=first_field(line);
+            if(id.empty()) return;
+            auto hash=std::hash<Text>{}(id);
+            raw[worker][hash%buckets].push_back({hash,line});
         });
     });
-    timer.lap("parse and partition raw events");
-    std::vector<Parts<Event>> events(threads);
-    parallel(buckets,threads,[&](size_t b,int worker) {
-        std::unordered_map<Text,const Raw*> first;
+    timer.lap("partition event IDs");
+    std::array<Repeats,buckets> repeats;
+    parallel(buckets,threads,[&](size_t b,int) {
         size_t n=0;
         for(auto& src:raw) n+=src[b].size();
-        first.reserve(n);
+        Fingerprints seen;
+        seen.size_for(n);
+        auto& r=repeats[b];
+        r.possible.size_for(n);
         for(auto& src:raw) for(const auto& row:src[b]) {
-            auto [it,added]=first.emplace(row.id,&row);
-            if(!added && row.ingest<it->second->ingest) it->second=&row;
+            if(seen.has(row.hash)) r.possible.add(row.hash);
+            seen.add(row.hash);
         }
-        for(auto [key,row]:first) keep_event(*row,dims,win,events[worker]);
-        first.clear();
-        for(auto& src:raw) std::vector<Raw>().swap(src[b]);
+        for(auto& src:raw) {
+            for(const auto& row:src[b]) {
+                if(!r.possible.has(row.hash)) continue;
+                std::array<Text,7> f;
+                if(!fields(row.line,f) || f[0].empty()) continue;
+                auto [it,added]=r.winners.emplace(f[0],Winner{f[3],row.line.data()});
+                if(!added && f[3]<it->second.ingest) it->second={f[3],row.line.data()};
+            }
+            std::vector<Raw>().swap(src[b]);
+        }
     });
-    timer.lap("dedup and validate events");
+    timer.lap("resolve potential duplicate IDs");
+    std::vector<Parts<Event>> events(threads);
+    parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
+        lines(event_files.chunks[i],[&](Text line) {
+            std::array<Text,7> f;
+            if(!fields(line,f) || f[0].empty()) return;
+            auto hash=std::hash<Text>{}(f[0]);
+            const auto& r=repeats[hash%buckets];
+            if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
+            keep_event(f,dims,win,events[worker]);
+        });
+    });
+    timer.lap("parse and validate winners");
     std::vector<Parts<Click>> clicks(threads);
     parallel(click_files.chunks.size(),threads,[&](size_t i,int worker) {
         lines(click_files.chunks[i],[&](Text line) {
