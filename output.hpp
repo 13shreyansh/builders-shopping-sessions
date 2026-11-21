@@ -12,7 +12,7 @@ template<class T> T take(arrow::Result<T> r) {
     return std::move(r).ValueOrDie();
 }
 
-struct UserRow { Text user; int day; int sessions; int events; I64 revenue; Text top; bool has_top; };
+struct UserRow { Person user; int day; int sessions; int events; I64 revenue; Text top; bool has_top; };
 struct Totals {
     I64 sessions=0, purchases=0, revenue=0, assists=0;
     void merge(const Totals& o) {
@@ -42,13 +42,14 @@ inline void parquet_file(const fs::path& path, const std::vector<std::string>& n
     check(sink->Close());
 }
 
-inline void write_users(const fs::path& path,const std::vector<UserRow>& rows) {
+inline void write_users(const fs::path& path,const std::vector<UserRow>& rows,const People& people) {
     arrow::StringBuilder user,top;
     arrow::Date32Builder day;
     arrow::Int32Builder sessions,events;
     arrow::Int64Builder revenue;
     for (const auto& r:rows) {
-        check(user.Append(r.user)); check(day.Append(r.day)); check(sessions.Append(r.sessions));
+        std::array<char,9> name;
+        check(user.Append(people.name(r.user,name))); check(day.Append(r.day)); check(sessions.Append(r.sessions));
         check(events.Append(r.events)); check(revenue.Append(r.revenue));
         if(r.has_top) check(top.Append(r.top)); else check(top.AppendNull());
     }

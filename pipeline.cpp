@@ -1,9 +1,10 @@
 #include "output.hpp"
 #include <chrono>
+#include <future>
 
 namespace {
 constexpr int buckets=64;
-unsigned bucket(Person who) { return who.order % buckets; }
+unsigned bucket(Person who) { return (who*0x9e3779b97f4a7c15ULL)>>(64-6); }
 template<class T> using Parts=std::array<std::vector<T>,buckets>;
 template<class T> std::vector<T> collect(std::vector<Parts<T>>& parts, int index) {
     size_t n=0;
@@ -76,10 +77,28 @@ Text first_field(Text line) {
     if(id.size()>=2 && id.front()=='"' && id.back()=='"') return id.substr(1,id.size()-2);
     return id;
 }
-struct Event { Person person; I64 ts; int cents,category; };
+struct WideEvent {
+    Person person;
+    I64 time;
+    int price,cat;
+    I64 timestamp(I64) const { return time; }
+    int cents() const { return price; }
+    int category() const { return cat; }
+    static WideEvent make(Person p,I64 ts,int price,int cat,I64) {return {p,ts,price,cat};}
+};
+struct PackedEvent {
+    Person person;
+    uint64_t payload;
+    I64 timestamp(I64 base) const { return base+I64(payload>>32); }
+    int cents() const { return int(payload&0xffffffU); }
+    int category() const { return int(uint32_t(payload)>>24); }
+    static PackedEvent make(Person p,I64 ts,int price,int cat,I64 base) {
+        return {p,(uint64_t(ts-base)<<32)|(uint64_t(cat)<<24)|unsigned(price)};
+    }
+};
 struct Click { Person person; I64 ts; Text id; int campaign; };
 
-void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
+template<class Event> void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst,AliasCache& cache) {
     if(f[1].empty() || f[5].empty()) return;
     I64 ts=timestamp(f[2]);
     if(ts<win.start || ts>=win.end || timestamp(f[3])-ts>day_ms) return;
@@ -91,13 +110,13 @@ void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window&
         auto it=dims.products.find(f[5]);
         if(it!=dims.products.end()) category=it->second;
     } else if(f[4]!="view" && f[4]!="cart") return;
-    Person who=dims.people(f[1]);
-    dst[bucket(who)].push_back({who,ts,cents,category});
+    Person who=dims.people.lookup(f[1],cache);
+    dst[bucket(who)].push_back(Event::make(who,ts,cents,category,win.start));
 }
 
-void process_person(const Event* events,const Event* end,const Click* click,const Click* click_end,
-                    const Dimensions& dims,Campaigns& totals,std::vector<UserRow>& users) {
-    const Text person=events->person.name;
+template<class Event> void process_person(const Event* events,const Event* end,const Click* click,const Click* click_end,
+                    const Dimensions& dims,Campaigns& totals,std::vector<UserRow>& users,I64 base) {
+    const Person person=events->person;
     std::unordered_map<int,int> active;
     const Click* expire=click;
     int latest=0;
@@ -113,7 +132,7 @@ void process_person(const Event* events,const Event* end,const Click* click,cons
         cat_totals.clear();
     };
     while(events!=end) {
-        I64 start=events->ts;
+        I64 start=events->timestamp(base);
         int day=static_cast<int>(start/day_ms-(start%day_ms<0));
         if(!row.sessions || row.day!=day) {
             if(row.sessions) flush();
@@ -123,10 +142,10 @@ void process_person(const Event* events,const Event* end,const Click* click,cons
         I64 prev=start,sum=0;
         do {
             ++row.events;
-            if(events->cents) { sum+=events->cents; cat_totals[events->category]+=events->cents; }
-            prev=events->ts;
+            if(events->cents()) { sum+=events->cents(); cat_totals[events->category()]+=events->cents(); }
+            prev=events->timestamp(base);
             ++events;
-        } while(events!=end && events->ts-prev<=1800000);
+        } while(events!=end && events->timestamp(base)-prev<=1800000);
         row.revenue+=sum;
         while(click!=click_end && click->ts<=start) {
             latest=click->campaign;
@@ -156,12 +175,45 @@ struct Profile {
         mark=now;
     }
 };
+// Group equal owner codes in place. Bytes shared by the entire range need no pass.
+template<class E> void group_owners(E* first,E* last) {
+    size_t n=last-first;
+    if(n<64) {
+        std::sort(first,last,[](const E& a,const E& b){return a.person<b.person;});
+        return;
+    }
+    uint64_t different=0, base=first->person;
+    for(auto* p=first+1;p!=last;++p) different|=p->person^base;
+    if(!different) return;
+    unsigned shift=(63-__builtin_clzll(different))&~7u;
+    auto lane=[shift](const E& row){return unsigned((row.person>>shift)&255);};
+    std::array<size_t,256> counts{},next{},end{};
+    for(auto* p=first;p!=last;++p) ++counts[lane(*p)];
+    size_t off=0;
+    for(unsigned b=0;b<256;++b) {
+        next[b]=off;
+        off+=counts[b];
+        end[b]=off;
+    }
+    for(unsigned b=0;b<256;++b) {
+        while(next[b]<end[b]) {
+            auto& row=first[next[b]];
+            unsigned target=lane(row);
+            if(target==b) ++next[b];
+            else std::swap(row,first[next[target]++]);
+        }
+    }
+    if(shift) for(unsigned b=0;b<256;++b) if(counts[b]>1)
+        group_owners(first+end[b]-counts[b], first+end[b]);
+}
+
 void run(const fs::path& data,const fs::path& out,int threads) {
     Profile timer;
     Window win(data/"manifest.json");
     MappedFiles dim_files,event_files,click_files;
     Dimensions dims;
-    dims.load(dim_files,data);
+    auto dimension_job=std::async(threads>1 ? std::launch::async : std::launch::deferred,
+                                  [&] { dims.load(dim_files,data); });
     event_files.folder(data/"events");
     click_files.folder(data/"clicks");
     fs::create_directories(out/"user_daily");
@@ -201,76 +253,87 @@ void run(const fs::path& data,const fs::path& out,int threads) {
         }
     });
     timer.lap("resolve potential duplicate IDs");
-    std::vector<Parts<Event>> events(threads);
-    parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
-        lines(event_files.chunks[i],[&](Text line) {
-            std::array<Text,7> f;
-            if(!scan_fields(line,f) || f[0].empty()) return;
-            auto hash=text_hash(f[0]);
-            const auto& r=repeats[hash%buckets];
-            if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
-            keep_event(f,dims,win,events[worker]);
+    dimension_job.get();
+    timer.lap("await dimensions");
+    auto finish=[&](auto representation) {
+        using Event=decltype(representation);
+        std::vector<AliasCache> caches(threads);
+        std::vector<Parts<Event>> events(threads);
+        parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
+            lines(event_files.chunks[i],[&](Text line) {
+                std::array<Text,7> f;
+                if(!scan_fields(line,f) || f[0].empty()) return;
+                auto hash=text_hash(f[0]);
+                const auto& r=repeats[hash%buckets];
+                if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
+                keep_event(f,dims,win,events[worker],caches[worker]);
+            });
         });
-    });
-    timer.lap("parse and validate winners");
-    std::vector<Parts<Click>> clicks(threads);
-    parallel(click_files.chunks.size(),threads,[&](size_t i,int worker) {
-        lines(click_files.chunks[i],[&](Text line) {
-            std::array<Text,4> f;
-            if(!scan_fields(line,f) || f[0].empty() || f[1].empty()) return;
-            I64 ts=timestamp(f[3]);
-            auto it=dims.campaign_ids.find(f[2]);
-            if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
-            Person who=dims.people(f[1]);
-            clicks[worker][bucket(who)].push_back({who,ts,f[0],it->second});
+        timer.lap("parse and validate winners");
+        std::vector<Parts<Click>> clicks(threads);
+        parallel(click_files.chunks.size(),threads,[&](size_t i,int worker) {
+            lines(click_files.chunks[i],[&](Text line) {
+                std::array<Text,4> f;
+                if(!scan_fields(line,f) || f[0].empty() || f[1].empty()) return;
+                I64 ts=timestamp(f[3]);
+                auto it=dims.campaign_ids.find(f[2]);
+                if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
+                Person who=dims.people.lookup(f[1],caches[worker]);
+                clicks[worker][bucket(who)].push_back({who,ts,f[0],it->second});
+            });
         });
-    });
-    timer.lap("parse clicks");
-    std::array<Campaigns,buckets> campaign_parts;
-    std::array<std::vector<UserRow>,buckets> user_parts;
-    struct Partition { std::vector<Event> events; std::vector<Click> clicks; };
-    std::array<Partition,buckets> sorted;
-    parallel(buckets,threads,[&](size_t b,int) {
-        auto& p=sorted[b];
-        p.events=collect(events,b);
-        p.clicks=collect(clicks,b);
-        std::sort(p.events.begin(),p.events.end(),[](const Event& a,const Event& b) {
-            return a.person!=b.person ? a.person<b.person : a.ts<b.ts;
+        timer.lap("parse clicks");
+        std::array<Campaigns,buckets> campaign_parts;
+        std::array<std::vector<UserRow>,buckets> user_parts;
+        struct Partition { std::vector<Event> events; std::vector<Click> clicks; };
+        std::array<Partition,buckets> sorted;
+        parallel(buckets,threads,[&](size_t b,int) {
+            auto& p=sorted[b];
+            p.events=collect(events,b);
+            p.clicks=collect(clicks,b);
+            if(p.events.size()>1) group_owners(p.events.data(),p.events.data()+p.events.size());
+            std::sort(p.clicks.begin(),p.clicks.end(),[](const Click& a,const Click& b) {
+                if(a.person!=b.person) return a.person<b.person;
+                if(a.ts!=b.ts) return a.ts<b.ts;
+                return a.id>b.id;
+            });
+            p.clicks.erase(std::unique(p.clicks.begin(),p.clicks.end(),[](const Click& a,const Click& b) {
+                return a.id==b.id;
+            }),p.clicks.end());
         });
-        std::sort(p.clicks.begin(),p.clicks.end(),[](const Click& a,const Click& b) {
-            if(a.person!=b.person) return a.person<b.person;
-            if(a.ts!=b.ts) return a.ts<b.ts;
-            return a.id>b.id;
+        timer.lap("sort people and dedup clicks");
+        parallel(buckets,threads,[&](size_t b,int) {
+            auto& e=sorted[b].events;
+            auto& c=sorted[b].clicks;
+            size_t ci=0;
+            for(size_t i=0,j;i<e.size();i=j) {
+                for(j=i+1;j<e.size() && e[j].person==e[i].person;++j) {}
+                if(j-i>1) std::sort(e.begin()+i,e.begin()+j,[&](const Event& a,const Event& b) {
+                    return a.timestamp(win.start)<b.timestamp(win.start);
+                });
+                while(ci<c.size() && c[ci].person<e[i].person) ++ci;
+                size_t begin=ci;
+                while(ci<c.size() && c[ci].person==e[i].person) ++ci;
+                const Click* first=begin==ci ? nullptr : c.data()+begin;
+                const Click* last=begin==ci ? nullptr : c.data()+ci;
+                process_person(e.data()+i,e.data()+j,first,last,dims,campaign_parts[b],user_parts[b],win.start);
+            }
+            std::vector<Event>().swap(e);
+            std::vector<Click>().swap(c);
         });
-        p.clicks.erase(std::unique(p.clicks.begin(),p.clicks.end(),[](const Click& a,const Click& b) {
-            return a.id==b.id;
-        }),p.clicks.end());
-    });
-    timer.lap("sort people and dedup clicks");
-    parallel(buckets,threads,[&](size_t b,int) {
-        auto& e=sorted[b].events;
-        auto& c=sorted[b].clicks;
-        size_t ci=0;
-        for(size_t i=0,j;i<e.size();i=j) {
-            for(j=i+1;j<e.size() && e[j].person==e[i].person;++j) {}
-            while(ci<c.size() && c[ci].person<e[i].person) ++ci;
-            size_t begin=ci;
-            while(ci<c.size() && c[ci].person==e[i].person) ++ci;
-            const Click* first=begin==ci ? nullptr : c.data()+begin;
-            const Click* last=begin==ci ? nullptr : c.data()+ci;
-            process_person(e.data()+i,e.data()+j,first,last,dims,campaign_parts[b],user_parts[b]);
-        }
-        std::vector<Event>().swap(e);
-        std::vector<Click>().swap(c);
-    });
-    timer.lap("sessions, attribution and assists");
-    Campaigns all;
-    for(auto& part:campaign_parts) for(auto& [key,t]:part) all[key].merge(t);
-    parallel(buckets,threads,[&](size_t b,int) {
-        if(b==0 || !user_parts[b].empty()) write_users(out/"user_daily"/(std::to_string(b)+".parquet"),user_parts[b]);
-    });
-    write_campaigns(out/"campaign_daily"/"part.parquet",all,dims.campaigns);
-    timer.lap("Parquet and campaign merge");
+        timer.lap("sessions, attribution and assists");
+        Campaigns all;
+        for(auto& part:campaign_parts) for(auto& [key,t]:part) all[key].merge(t);
+        parallel(buckets,threads,[&](size_t b,int) {
+            if(b==0 || !user_parts[b].empty()) write_users(out/"user_daily"/(std::to_string(b)+".parquet"),user_parts[b],dims.people);
+        });
+        write_campaigns(out/"campaign_daily"/"part.parquet",all,dims.campaigns);
+        timer.lap("Parquet and campaign merge");
+    };
+    if(uint64_t(win.end-win.start)<=uint64_t(UINT32_MAX)+1 && dims.categories.size()<=256)
+        finish(PackedEvent{});
+    else
+        finish(WideEvent{});
 }
 }
 int main(int argc,char** argv) {

@@ -19,7 +19,10 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #elif defined(__SSE2__)
-#include <emmintrin.h>
+#include <immintrin.h>
+#endif
+#if defined(__BMI2__)
+#include <immintrin.h>
 #endif
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -115,7 +118,61 @@ inline Delimiters delimiters(const char* p) {
             unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(v,_mm_set1_epi8('"'))))};
 #endif
 }
+#if defined(__AVX2__)
+struct Masks64 { uint64_t commas,quotes; };
+inline Masks64 masks32(const char* p) {
+    auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return {uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8(',')))),
+            uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('"'))))};
+}
+inline Masks64 masks64(const char* p) {
+    auto left=masks32(p),right=masks32(p+32);
+    return {left.commas|(right.commas<<32),left.quotes|(right.quotes<<32)};
+}
+template<size_t N> bool decode_masks(Text line,std::array<Text,N>& out,Masks64 lo,Masks64 hi) {
+    if(__builtin_popcountll(lo.commas)+__builtin_popcountll(hi.commas)!=N-1) return false;
+    std::array<unsigned,N> ends;
+    unsigned col=0;
+    while(lo.commas) { ends[col++]=__builtin_ctzll(lo.commas); lo.commas&=lo.commas-1; }
+    while(hi.commas) { ends[col++]=64+__builtin_ctzll(hi.commas); hi.commas&=hi.commas-1; }
+    ends[N-1]=line.size();
+    unsigned start=0,wrapped=0;
+    for(size_t i=0;i<N;++i) {
+        unsigned end=ends[i];
+        unsigned len=end-start;
+        unsigned quoted=len>=2 && line[start]=='"' && line[end-1]=='"';
+        out[i]=Text(line.data()+start+quoted,len-2*quoted);
+        wrapped+=quoted;
+        start=end+1;
+    }
+    return 2*wrapped==unsigned(__builtin_popcountll(lo.quotes)+__builtin_popcountll(hi.quotes));
+}
+template<size_t N> bool read_avx2(Text line,std::array<Text,N>& out) {
+    const char* p=line.data();
+    Masks64 lo,hi{};
+    if(line.size()<=64) {
+        lo=masks32(p);
+        if(line.size()>32) {
+            unsigned skip=64-line.size();
+            auto tail=masks32(p+line.size()-32);
+            lo.commas|=(tail.commas>>skip)<<32;
+            lo.quotes|=(tail.quotes>>skip)<<32;
+        }
+    } else {
+        lo=masks64(p);
+        unsigned skip=128-line.size();
+        auto tail=masks64(p+line.size()-64);
+        hi={tail.commas>>skip,tail.quotes>>skip};
+    }
+    return decode_masks(line,out,lo,hi);
+}
+#endif
 template<size_t N> bool scan_fields(Text line,std::array<Text,N>& out) {
+#if defined(__AVX2__)
+    if(line.size()<=128) {
+        if(line.size()>=32) return read_avx2(line,out);
+    }
+#endif
     // Long and short lines retain exactly the same scalar dialect.
     if(line.size()<16 || line.size()>192) return fields(line,out);
     std::array<unsigned,N> ends;
@@ -172,26 +229,75 @@ inline I64 numeric(Text s) {
     return s.front()>='0' && s.front()<='9' && res.ec==std::errc{} && res.ptr==s.data()+s.size() ? v : bad;
 }
 
+// Validate the calendar prefix on cache misses, including leap days.
+inline I64 civil_midnight(Text s,int day) {
+    if(s[4]!='-' || s[7]!='-') return bad;
+    int year=digits(s,0,4),month=digits(s,5,2);
+    if(year<1 || month<1 || month>12) return bad;
+    constexpr int month_days[]={31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap=year%4==0 && (year%100!=0 || year%400==0);
+    if(day<1 || day>month_days[month-1]+(month==2 && leap)) return bad;
+    year-=month<=2;
+    int era=year/400,within=year%400;
+    int doy=(153*(month+(month>2?-3:9))+2)/5+day-1;
+    I64 days=era*146097+within*365+within/4-within/100+doy-719468;
+    return days*day_ms;
+}
+
+inline uint64_t read_u64(const char* p) {
+    uint64_t v;
+    std::memcpy(&v,p,sizeof(v));
+    return v;
+}
+inline int read_pair(const char* p) {
+    static constexpr auto pairs=[] {
+        std::array<uint8_t,65536> result{};
+        for(unsigned i=0;i<100;++i) result[('0'+i/10)|(('0'+i%10)<<8)]=i+1;
+        return result;
+    }();
+    uint16_t key;
+    std::memcpy(&key,p,sizeof(key));
+    return int(pairs[key])-1;
+}
+inline bool eight_digits(uint64_t bytes) {
+    constexpr uint64_t high=0x8080808080808080ULL;
+    return !(((bytes+0x4646464646464646ULL)|(bytes-0x3030303030303030ULL))&high);
+}
+inline uint32_t parse_eight(uint64_t bytes) {
+    uint64_t digits=bytes&0x0f0f0f0f0f0f0f0fULL;
+    uint64_t pairs=(digits*10+(digits>>8))&0x00ff00ff00ff00ffULL;
+    uint64_t quads=(pairs*100+(pairs>>16))&0x0000ffff0000ffffULL;
+    return uint32_t(quads)*10000+uint32_t(quads>>32);
+}
 inline I64 timestamp(Text s) {
-    if ((s.size()!=20 && s.size()!=25) || s[4]!='-') return numeric(s);
-    if (s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return bad;
-    int y=digits(s,0,4),m=digits(s,5,2),d=digits(s,8,2);
-    int h=digits(s,11,2),min=digits(s,14,2),sec=digits(s,17,2);
-    if(y<1 || m<1 || m>12 || d<1 || h<0 || h>23 || min<0 || min>59 || sec<0 || sec>59) return bad;
-    constexpr int month_lengths[]={31,28,31,30,31,30,31,31,30,31,30,31};
-    bool leap=(y%4==0 && (y%100!=0 || y%400==0));
-    if(d>month_lengths[m-1]+(m==2 && leap)) return bad;
-    int offset=0;
-    if (s.size()==20) { if (s[19]!='Z') return bad; }
-    else {
-        int oh=digits(s,20,2),om=digits(s,23,2);
-        if((s[19]!='+' && s[19]!='-') || s[22]!=':' || oh<0 || oh>23 || om<0 || om>59) return bad;
-        offset=(oh*60+om)*(s[19]=='+' ? 1 : -1);
+    if(s.size()==13) {
+        uint64_t first=read_u64(s.data()),last=read_u64(s.data()+5);
+        if(!eight_digits(first) || !eight_digits(last)) return bad;
+        return I64(parse_eight(first)/1000)*100000000+parse_eight(last);
     }
-    y -= m<=2;
-    int era=y/400, year=y%400, doy=(153*(m+(m>2?-3:9))+2)/5+d-1;
-    I64 day=era*146097+year*365+year/4-year/100+doy-719468;
-    return day*day_ms+((h*60+min-offset)*60+sec)*1000LL;
+    if((s.size()!=20 && s.size()!=25) || s[4]!='-') return numeric(s);
+    if(s[10]!='T' || s[13]!=':' || s[16]!=':') return bad;
+    int day=read_pair(s.data()+8);
+    if(unsigned(day-1)>=31) return bad;
+    struct Date {uint64_t prefix=0; I64 midnight=0; bool valid=false;};
+    static thread_local std::array<Date,32> cache{};
+    auto& d=cache[day];
+    uint64_t prefix=read_u64(s.data());
+    if(!d.valid || d.prefix!=prefix) {
+        auto t=civil_midnight(s,day);
+        if(t==bad) return bad;
+        d={prefix,t,true};
+    }
+    int h=read_pair(s.data()+11),m=read_pair(s.data()+14),sec=read_pair(s.data()+17);
+    if(unsigned(h)>=24 || unsigned(m)>=60 || unsigned(sec)>=60) return bad;
+    int zone=0;
+    if(s.size()==20) { if(s[19]!='Z') return bad; }
+    else {
+        int zh=read_pair(s.data()+20),zm=read_pair(s.data()+23);
+        if((s[19]!='+' && s[19]!='-') || s[22]!=':' || unsigned(zh)>=24 || unsigned(zm)>=60) return bad;
+        zone=(zh*60+zm)*(s[19]=='+' ? 1 : -1);
+    }
+    return d.midnight+((h*60+m-zone)*60+sec)*1000LL;
 }
 
 struct Window {
@@ -268,19 +374,56 @@ struct NameIndex {
     }
 };
 
-struct Person {
-    Text name;
-    uint64_t order;
-    bool operator==(const Person& other) const {
-        return order==other.order && (!(order>>63) || name==other.name);
+// Nine nonzero ASCII bytes fit in 63 bits. Zero padding recovers the length.
+using Person=uint64_t;
+constexpr Person linked_tag=uint64_t(1)<<63, extended_tag=linked_tag|(linked_tag>>1);
+inline uint64_t pack_ascii(Text s) {
+    if(s.empty() || s.size()>9) return 0;
+    uint64_t raw=0;
+    if(s.size()>=8) {
+        std::memcpy(&raw,s.data(),8);
+        constexpr uint64_t high=0x8080808080808080ULL;
+        if((raw&high) || ((raw-0x0101010101010101ULL)&~raw&high)) return 0;
+    } else {
+        for(size_t i=0;i<s.size();++i) {
+            unsigned byte=static_cast<unsigned char>(s[i]);
+            if(!byte || byte>127) return 0;
+            raw|=uint64_t(byte)<<(8*i);
+        }
     }
-    bool operator!=(const Person& other) const { return !(*this==other); }
-    bool operator<(const Person& other) const {
-        if(order!=other.order) return order<other.order;
-        return (order>>63) && name<other.name;
+    unsigned last=s.size()==9 ? static_cast<unsigned char>(s[8]) : 0;
+    if(s.size()==9 && (!last || last>127)) return 0;
+#if defined(__BMI2__)
+    uint64_t packed=_pext_u64(raw,0x7f7f7f7f7f7f7f7fULL);
+#else
+    uint64_t packed=0;
+    for(unsigned i=0;i<8;++i) packed|=((raw>>(8*i))&127)<<(7*i);
+#endif
+    return packed|(uint64_t(last)<<56);
+}
+struct ExtendedNames {
+    struct Shard {
+        std::mutex lock;
+        NameIndex index;
+        std::vector<Text> names;
+    };
+    std::array<Shard,64> shards;
+    Person intern(Text s,uint64_t hash) {
+        unsigned shard=hash%shards.size();
+        auto& storage=shards[shard];
+        std::lock_guard<std::mutex> guard(storage.lock);
+        auto [id,added]=storage.index.insert(s,storage.names.size());
+        if(added) storage.names.push_back(s);
+        return extended_tag|(uint64_t(shard)<<32)|static_cast<unsigned>(id);
     }
+    Text lookup(Person p) const { return shards[(p>>32)&63].names[uint32_t(p)]; }
+};
+struct AliasCache {
+    struct Entry { Text key; uint64_t hash=0; Person person{}; };
+    std::array<Entry,4096> slots{};
 };
 struct People {
+    mutable ExtendedNames extended;
     NameIndex index;
     std::vector<int> parents, sizes;
     std::vector<Text> names;
@@ -300,11 +443,38 @@ struct People {
         parents[b]=a; sizes[a]+=sizes[b];
         names[a]=std::min(names[a],names[b]);
     }
-    void finish() { for(auto& e:index.slots) if(!e.key.empty()) e.value=root(e.value); }
-    Person operator()(Text s) const {
+    // Each slot in the directory marks 64 hash buckets. A clear bit proves absence.
+    std::vector<uint64_t> membership;
+    void finish() {
+        size_t words=1;
+        while(words<index.used/4) words*=2;
+        membership.assign(words,0);
+        for(auto& e:index.slots) if(!e.key.empty()) {
+            e.value=root(e.value);
+            membership[(e.hash>>6)&(words-1)] |= uint64_t(1)<<(e.hash&63);
+        }
+    }
+    Person standalone(Text s,uint64_t h) const {
+        uint64_t packed=pack_ascii(s);
+        return packed ? packed : extended.intern(s,h);
+    }
+    Person lookup(Text s,AliasCache& cache) const {
         uint64_t h=text_hash(s);
+        if(!(membership[(h>>6)&(membership.size()-1)] & (uint64_t(1)<<(h&63))))
+            return standalone(s,h);
+        auto& cached=cache.slots[(h^(h>>32))&(cache.slots.size()-1)];
+        if(cached.hash==h && cached.key==s) return cached.person;
         const auto& e=index.slots[index.locate(s,h)];
-        if(e.key.empty()) return {s,h|(uint64_t(1)<<63)};
-        return {names[e.value],static_cast<uint64_t>(e.value)};
+        if(e.key.empty()) return standalone(s,h);
+        Person result=linked_tag|static_cast<unsigned>(e.value);
+        cached={s,h,result};
+        return result;
+    }
+    Text name(Person p,std::array<char,9>& buf) const {
+        if((p&extended_tag)==extended_tag) return extended.lookup(p);
+        if(p&linked_tag) return names[uint32_t(p)];
+        size_t len=0;
+        while(p) { buf[len++]=char(p&127); p>>=7; }
+        return Text(buf.data(),len);
     }
 };
