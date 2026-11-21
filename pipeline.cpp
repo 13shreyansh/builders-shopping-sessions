@@ -66,8 +66,17 @@ struct Fingerprints {
     bool has(uint64_t hash) const { return (words[index(hash)]&mask(hash))==mask(hash); }
     void add(uint64_t hash) { words[index(hash)]|=mask(hash); }
 };
-struct Raw { uint64_t hash; Text line; };
-struct Winner { Text ingest; const char* row; };
+struct Raw {
+    uint64_t hash;
+    const char* row;
+    uint32_t chunk, ordinal;
+    Text line(const std::vector<Text>& chunks) const {
+        Text source=chunks[chunk];
+        Text tail=source.substr(row-source.data());
+        return tail.substr(0,tail.find('\n'));
+    }
+};
+struct Winner { Text ingest; uint32_t chunk,ordinal; };
 struct Repeats {
     Fingerprints possible;
     std::unordered_map<Text,Winner> winners;
@@ -219,23 +228,30 @@ void run(const fs::path& data,const fs::path& out,int threads) {
     fs::create_directories(out/"user_daily");
     fs::create_directories(out/"campaign_daily");
     timer.lap("dimensions and mapping");
+    if(event_files.chunks.size()>UINT32_MAX) throw std::length_error("too many event chunks");
     std::vector<Parts<Raw>> raw(threads);
+    // A chunk ends at the first LF after 512 KiB, so even an oversized final
+    // record cannot put more than 524289 physical rows in one chunk.
+    std::vector<std::vector<uint64_t>> discarded(event_files.chunks.size());
     parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
+        uint32_t ordinal=0;
         lines(event_files.chunks[i],[&](Text line) {
+            uint32_t row=ordinal++;
             Text id=first_field(line);
             if(id.empty()) return;
             auto hash=text_hash(id);
-            raw[worker][hash%buckets].push_back({hash,line});
+            raw[worker][hash%buckets].push_back({hash,line.data(),static_cast<uint32_t>(i),row});
         });
+        discarded[i].resize((ordinal+63)/64);
     });
     timer.lap("partition event IDs");
-    std::array<Repeats,buckets> repeats;
+
     parallel(buckets,threads,[&](size_t b,int) {
         size_t n=0;
         for(auto& src:raw) n+=src[b].size();
         Fingerprints seen;
         seen.size_for(n);
-        auto& r=repeats[b];
+        Repeats r;
         r.possible.size_for(n);
         for(auto& src:raw) for(const auto& row:src[b]) {
             if(seen.has(row.hash)) r.possible.add(row.hash);
@@ -245,9 +261,15 @@ void run(const fs::path& data,const fs::path& out,int threads) {
             for(const auto& row:src[b]) {
                 if(!r.possible.has(row.hash)) continue;
                 std::array<Text,7> f;
-                if(!scan_fields(row.line,f) || f[0].empty()) continue;
-                auto [it,added]=r.winners.emplace(f[0],Winner{f[3],row.line.data()});
-                if(!added && f[3]<it->second.ingest) it->second={f[3],row.line.data()};
+                if(!scan_fields(row.line(event_files.chunks),f) || f[0].empty()) continue;
+                Winner current{f[3],row.chunk,row.ordinal};
+                auto [it,added]=r.winners.emplace(f[0],current);
+                if(!added) {
+                    if(current.ingest<it->second.ingest) std::swap(current,it->second);
+                    // Separate event-ID buckets can reject rows in the same word.
+                    auto& word=discarded[current.chunk][current.ordinal/64];
+                    __atomic_fetch_or(&word,uint64_t(1)<<(current.ordinal%64),__ATOMIC_RELAXED);
+                }
             }
             std::vector<Raw>().swap(src[b]);
         }
@@ -260,12 +282,13 @@ void run(const fs::path& data,const fs::path& out,int threads) {
         std::vector<AliasCache> caches(threads);
         std::vector<Parts<Event>> events(threads);
         parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
+            const auto& skip=discarded[i];
+            uint32_t ordinal=0;
             lines(event_files.chunks[i],[&](Text line) {
+                uint32_t row=ordinal++;
+                if(skip[row/64] & (uint64_t(1)<<(row%64))) return;
                 std::array<Text,7> f;
                 if(!scan_fields(line,f) || f[0].empty()) return;
-                auto hash=text_hash(f[0]);
-                const auto& r=repeats[hash%buckets];
-                if(r.possible.has(hash) && r.winners.at(f[0]).row!=line.data()) return;
                 keep_event(f,dims,win,events[worker],caches[worker]);
             });
         });
