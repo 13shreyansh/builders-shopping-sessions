@@ -55,61 +55,83 @@ struct Fingerprints {
     bool has(uint64_t hash) const { return (words[index(hash)]&mask(hash))==mask(hash); }
     void add(uint64_t hash) { words[index(hash)]|=mask(hash); }
 };
-struct Raw {
-    uint64_t hash;
-    const char* row;
-    uint32_t chunk, ordinal;
-    Text line(const std::vector<Text>& chunks) const {
-        Text source=chunks[chunk];
-        Text tail=source.substr(row-source.data());
-        return tail.substr(0,tail.find('\n'));
-    }
-};
-struct Winner { Text ingest; uint32_t chunk,ordinal; };
-struct Repeats {
-    Fingerprints possible;
-    std::unordered_map<Text,Winner> winners;
-};
-Text first_field(Text line) {
-    Text id=line.substr(0,line.find(','));
-    if(id.size()>=2 && id.front()=='"' && id.back()=='"') return id.substr(1,id.size()-2);
-    return id;
-}
-struct WideEvent {
-    Person person;
+struct WidePayload {
     I64 time;
     int price,cat;
     I64 timestamp(I64) const { return time; }
     int cents() const { return price; }
     int category() const { return cat; }
-    static WideEvent make(Person p,I64 ts,int price,int cat,I64) {return {p,ts,price,cat};}
 };
-struct PackedEvent {
+struct WideEvent:WidePayload {
+    using Payload=WidePayload;
     Person person;
+    static WideEvent make(Person p,I64 ts,int price,int cat,I64) {return {{ts,price,cat},p};}
+};
+struct PackedPayload {
     uint64_t payload;
     I64 timestamp(I64 base) const { return base+I64(payload>>32); }
     int cents() const { return int(payload&0xffffffU); }
     int category() const { return int(uint32_t(payload)>>24); }
+};
+struct PackedEvent:PackedPayload {
+    using Payload=PackedPayload;
+    Person person;
     static PackedEvent make(Person p,I64 ts,int price,int cat,I64 base) {
-        return {p,(uint64_t(ts-base)<<32)|(uint64_t(cat)<<24)|unsigned(price)};
+        return {{(uint64_t(ts-base)<<32)|(uint64_t(cat)<<24)|unsigned(price)},p};
     }
 };
-struct Click { Person person; I64 ts; Text id; int campaign; };
+// Radix-sort only sufficiently large compact timelines. Equal times share a session.
+void sort_times(PackedPayload* first,size_t n,std::vector<PackedPayload>& scratch,I64) {
+    if(n<512) {
+        std::sort(first,first+n,[](auto a,auto b){return a.payload<b.payload;});
+        return;
+    }
+    size_t counts[4][256]{};
+    uint32_t varying=0,base=uint32_t(first->payload>>32);
+    for(size_t i=0;i<n;++i) {
+        uint32_t t=uint32_t(first[i].payload>>32);
+        varying|=t^base;
+        for(unsigned j=0;j<4;++j) ++counts[j][(t>>(j*8))&255];
+    }
+    scratch.resize(n);
+    auto in=first,out=scratch.data();
+    for(unsigned j=0;j<4;++j) {
+        unsigned shift=j*8;
+        if(!((varying>>shift)&255)) continue;
+        size_t total=0;
+        for(auto& z:counts[j]) {size_t count=z;z=total;total+=count;}
+        for(size_t i=0;i<n;++i) out[counts[j][(in[i].payload>>(32+shift))&255]++]=in[i];
+        std::swap(in,out);
+    }
+    if(in!=first) std::copy(in,in+n,first);
+}
+void sort_times(WidePayload* first,size_t n,std::vector<WidePayload>&,I64) {
+    std::sort(first,first+n,[](auto a,auto b){return a.time<b.time;});
+}
+struct Click {
+    Person person; I64 ts; const char* line; int campaign;
+    Text id() const {
+        const char* end=line;
+        while(*end!=',') ++end;
+        bool quote=*line=='"';
+        return Text(line+quote,size_t(end-line)-2*quote);
+    }
+};
 
-template<class Event> void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
-    if(f[1].empty() || f[5].empty()) return;
+template<class Event> Event decode_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,I64 ingest) {
+    if(f[1].empty() || f[5].empty()) return Event::make(UINT64_MAX,win.start,0,0,win.start);
     I64 ts=timestamp(f[2]);
-    if(ts<win.start || ts>=win.end || timestamp(f[3])-ts>day_ms) return;
+    if(ts<win.start || ts>=win.end || ingest-ts>day_ms) return Event::make(UINT64_MAX,win.start,0,0,win.start);
     int cents=0,category=0;
     if(f[4]=="purchase") {
         I64 price=numeric(f[6]);
-        if(price<1 || price>10000000) return;
+        if(price<1 || price>10000000) return Event::make(UINT64_MAX,win.start,0,0,win.start);
         cents=static_cast<int>(price);
         auto it=dims.products.find(f[5]);
         if(it!=dims.products.end()) category=it->second;
-    } else if(f[4]!="view" && f[4]!="cart") return;
+    } else if(f[4]!="view" && f[4]!="cart") return Event::make(UINT64_MAX,win.start,0,0,win.start);
     Person who=dims.people.raw(f[1]);
-    dst[bucket(who)].push_back(Event::make(who,ts,cents,category,win.start));
+    return Event::make(who,ts,cents,category,win.start);
 }
 
 struct DailyScratch {
@@ -165,7 +187,7 @@ template<class Event> void process_person(Person person,const Event* events,cons
                     const Dimensions& dims,CampaignGrid& totals,std::vector<UserRow>& users,I64 base,DailyScratch& scratch) {
 
     const Click* expire=click;
-    int latest=0;
+    const Click* latest=nullptr;
 
     UserRow row{person,0,0,0,0,{},false};
     auto flush=[&] {
@@ -201,7 +223,7 @@ template<class Event> void process_person(Person person,const Event* events,cons
         } while(events!=end && events->timestamp(base)-prev<=1800000);
         row.revenue+=sum;
         while(click!=click_end && click->ts<=start) {
-            latest=click->campaign;
+            if(!latest || latest->ts!=click->ts || click->id()<latest->id()) latest=click;
             scratch.add_click(click->campaign);
             ++click;
         }
@@ -209,7 +231,7 @@ template<class Event> void process_person(Person person,const Event* events,cons
             scratch.expire_click(expire->campaign);
             ++expire;
         }
-        auto& credit=totals.at(scratch.active.empty()?0:latest,day);
+        auto& credit=totals.at(scratch.active.empty()?0:latest->campaign,day);
         ++credit.sessions;
         credit.purchases+=sum>0;
         credit.revenue+=sum;
@@ -276,68 +298,48 @@ void run(const fs::path& data,const fs::path& out,int threads) {
     fs::create_directories(out/"user_daily");
     fs::create_directories(out/"campaign_daily");
     timer.lap("dimensions and mapping");
-    if(event_files.chunks.size()>UINT32_MAX) throw std::length_error("too many event chunks");
-    std::vector<Parts<Raw>> raw(threads);
-    // A chunk ends at the first LF after 512 KiB, so even an oversized final
-    // record cannot put more than 524289 physical rows in one chunk.
-    std::vector<std::vector<uint64_t>> discarded(event_files.chunks.size());
-    parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
-        uint32_t ordinal=0;
-        lines(event_files.chunks[i],[&](Text line) {
-            uint32_t row=ordinal++;
-            Text id=first_field(line);
-            if(id.empty()) return;
-            auto hash=text_hash(id);
-            raw[worker][hash%buckets].push_back({hash,line.data(),static_cast<uint32_t>(i),row});
-        });
-        discarded[i].resize((ordinal+63)/64);
-    });
-    timer.lap("partition event IDs");
-
-    parallel(buckets,threads,[&](size_t b,int) {
-        size_t n=0;
-        for(auto& src:raw) n+=src[b].size();
-        Fingerprints seen;
-        seen.size_for(n);
-        Repeats r;
-        r.possible.size_for(n);
-        for(auto& src:raw) for(const auto& row:src[b]) {
-            if(seen.has(row.hash)) r.possible.add(row.hash);
-            seen.add(row.hash);
-        }
-        for(auto& src:raw) {
-            for(const auto& row:src[b]) {
-                if(!r.possible.has(row.hash)) continue;
-                std::array<Text,7> f;
-                if(!scan_fields(row.line(event_files.chunks),f) || f[0].empty()) continue;
-                Winner current{f[3],row.chunk,row.ordinal};
-                auto [it,added]=r.winners.emplace(f[0],current);
-                if(!added) {
-                    if(current.ingest<it->second.ingest) std::swap(current,it->second);
-                    // Separate event-ID buckets can reject rows in the same word.
-                    auto& word=discarded[current.chunk][current.ordinal/64];
-                    __atomic_fetch_or(&word,uint64_t(1)<<(current.ordinal%64),__ATOMIC_RELAXED);
-                }
-            }
-            std::vector<Raw>().swap(src[b]);
-        }
-    });
-    timer.lap("resolve potential duplicate IDs");
+    People event_ids;
     auto finish=[&](auto representation) {
         using Event=decltype(representation);
-        std::vector<Parts<Event>> events(threads);
+        struct Version { Person id; I64 ingest; Event event; };
+        constexpr size_t shards=256;
+        std::vector<std::array<std::vector<Version>,shards>> versions(threads);
         parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
-            const auto& skip=discarded[i];
-            uint32_t ordinal=0;
             lines(event_files.chunks[i],[&](Text line) {
-                uint32_t row=ordinal++;
-                if(skip[row/64] & (uint64_t(1)<<(row%64))) return;
                 std::array<Text,7> f;
                 if(!scan_fields(line,f) || f[0].empty()) return;
-                keep_event(f,dims,win,events[worker]);
+                Person id=event_ids.raw(f[0]);
+                I64 ingest=timestamp(f[3]);
+                uint64_t h=OwnerGroups::hash(id);
+                versions[worker][h>>(64-8)].push_back({id,ingest,decode_event<Event>(f,dims,win,ingest)});
             });
         });
-        timer.lap("parse and validate winners");
+        timer.lap("decode versions and partition exact event IDs");
+        std::vector<Parts<Event>> events(threads);
+        parallel(shards,threads,[&](size_t b,int worker) {
+            size_t n=0;
+            for(auto& src:versions) n+=src[b].size();
+            auto keep=[&](const Version& row) {
+                if(row.event.person!=UINT64_MAX) events[worker][bucket(row.event.person)].push_back(row.event);
+            };
+            Fingerprints once,possible;
+            once.size_for(n);
+            possible.size_for(n);
+            for(auto& src:versions) for(auto& row:src[b]) {
+                uint64_t hash=OwnerGroups::hash(row.id)*0x9e3779b185ebca87ULL;
+                if(once.has(hash)) possible.add(hash);
+                once.add(hash);
+            }
+            std::unordered_map<Person,const Version*> winners;
+            for(auto& src:versions) for(auto& row:src[b]) {
+                if(!possible.has(OwnerGroups::hash(row.id)*0x9e3779b185ebca87ULL)) { keep(row); continue; }
+                auto [it,added]=winners.emplace(row.id,&row);
+                if(!added && row.ingest<it->second->ingest) it->second=&row;
+            }
+            for(const auto& item:winners) keep(*item.second);
+            for(auto& src:versions) std::vector<Version>().swap(src[b]);
+        });
+        timer.lap("select earliest exact versions");
         std::vector<Parts<Click>> clicks(threads);
         parallel(click_files.chunks.size(),threads,[&](size_t i,int worker) {
             lines(click_files.chunks[i],[&](Text line) {
@@ -347,7 +349,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
                 auto it=dims.campaign_ids.find(f[2]);
                 if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
                 Person who=dims.people.raw(f[1]);
-                clicks[worker][bucket(who)].push_back({who,ts,f[0],it->second});
+                clicks[worker][bucket(who)].push_back({who,ts,line.data(),it->second});
             });
         });
         timer.lap("parse clicks");
@@ -404,7 +406,8 @@ void run(const fs::path& data,const fs::path& out,int threads) {
                 g.click_end=nc;
                 nc+=g.clicks;
             }
-            std::vector<Event> e(ne);
+            using Payload=typename Event::Payload;
+            std::vector<Payload> e(ne);
             std::vector<Click> c(nc);
             for(auto& source:events) {
                 for(auto& x:source[b]) e[groups.ranges[x.person].event_end++]=x;
@@ -415,25 +418,24 @@ void run(const fs::path& data,const fs::path& out,int threads) {
                 std::vector<Click>().swap(source[b]);
             }
             std::vector<UserRow> users;
+            std::vector<Payload> sort_scratch;
             for(auto& g:groups.ranges) {
-                auto first=e.begin()+g.event_end-g.events,last=e.begin()+g.event_end;
-                if(g.events>1) std::sort(first,last,[&](const Event& a,const Event& b) {
-                    return a.timestamp(win.start)<b.timestamp(win.start);
-                });
+                auto first=e.begin()+g.event_end-g.events;
+                if(g.events>1) sort_times(&*first,g.events,sort_scratch,win.start);
                 const Click *first_click=nullptr,*last_click=nullptr;
                 if(g.clicks) {
                     Click* lo=c.data()+g.click_end-g.clicks;
                     Click* hi=c.data()+g.click_end;
                     std::sort(lo,hi,[](const Click& a,const Click& b) {
-                        return a.ts!=b.ts ? a.ts<b.ts : a.id>b.id;
+                        return a.ts<b.ts;
                     });
                     first_click=lo;
-                    last_click=std::unique(lo,hi,[](const Click& a,const Click& b){return a.id==b.id;});
+                    last_click=hi;
                 }
                 process_person(g.person,&*first,e.data()+g.event_end,first_click,last_click,dims,
                                campaign_parts[worker],users,win.start,scratch[worker]);
             }
-            std::vector<Event>().swap(e);
+            std::vector<Payload>().swap(e);
             std::vector<Click>().swap(c);
             if(b==0 || !users.empty()) write_users(out/"user_daily"/(std::to_string(b)+".parquet"),users,dims.people);
         });

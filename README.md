@@ -10,8 +10,12 @@ The entry code was written during the Builders Buildathon with Codex assistance 
 
 Alias resolution overlaps the first event-ID scan. A membership bitmap can prove an ID absent from the alias map. Positive probes compare the full string. Short standalone ASCII IDs have a reversible integer representation. Other standalone IDs use an exact sharded map. Events use a 16-byte representation when the observed window and category count fit its fields. Wider inputs retain full millisecond timestamps and category indices. The pipeline groups equal person codes before sorting each person's events by time.
 
-After comparing duplicate copies by full ID and ingest time, workers mark discarded physical rows in chunk-local bitmaps. Only earliest-ingest winners contribute to the output.
+Workers partition structurally valid versions by exact event ID. Each version retains its ingest timestamp and payload validity. Full keys select the earliest copy before any payload contributes to the outputs.
 
 Each worker counts rows by canonical person and scatters them into contiguous ranges. It sorts timestamps within each range, reuses campaign and category counters, and writes typed Parquet columns for the resulting user days. Large campaign/date domains use sparse totals.
 
 Workers parse compact raw user identifiers during link resolution. Each raw partition resolves distinct names by full equality before routing rows to their canonical owner. User-day column pages use LZ4 compression.
+
+Large compact timelines use radix sorting of millisecond timestamps. Short and wide-format timelines use comparison sorting.
+
+Click IDs are compared by full CSV field on timestamp ties. Repeated identical clicks preserve winner and unique-campaign assist semantics.
