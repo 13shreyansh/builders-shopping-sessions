@@ -30,6 +30,8 @@ struct Dimensions {
             campaigns.push_back({f[0],f[1]});
         });
         files.chunks.clear();
+    }
+    void load_links(MappedFiles& files,const fs::path& root) {
         files.folder(root/"links");
         for(Text chunk:files.chunks) lines(chunk,[&](Text line) {
             std::array<Text,2> f;
@@ -94,7 +96,7 @@ struct PackedEvent {
 };
 struct Click { Person person; I64 ts; Text id; int campaign; };
 
-template<class Event> void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst,AliasCache& cache) {
+template<class Event> void keep_event(const std::array<Text,7>& f,const Dimensions& dims,const Window& win,Parts<Event>& dst) {
     if(f[1].empty() || f[5].empty()) return;
     I64 ts=timestamp(f[2]);
     if(ts<win.start || ts>=win.end || timestamp(f[3])-ts>day_ms) return;
@@ -106,7 +108,7 @@ template<class Event> void keep_event(const std::array<Text,7>& f,const Dimensio
         auto it=dims.products.find(f[5]);
         if(it!=dims.products.end()) category=it->second;
     } else if(f[4]!="view" && f[4]!="cart") return;
-    Person who=dims.people.lookup(f[1],cache);
+    Person who=dims.people.raw(f[1]);
     dst[bucket(who)].push_back(Event::make(who,ts,cents,category,win.start));
 }
 
@@ -264,10 +266,11 @@ struct OwnerGroups {
 void run(const fs::path& data,const fs::path& out,int threads) {
     Profile timer;
     Window win(data/"manifest.json");
-    MappedFiles dim_files,event_files,click_files;
+    MappedFiles dim_files,link_files,event_files,click_files;
     Dimensions dims;
-    auto dimension_job=std::async(threads>1 ? std::launch::async : std::launch::deferred,
-                                  [&] { dims.load(dim_files,data); });
+    auto link_job=std::async(threads>1 ? std::launch::async : std::launch::deferred,
+                                  [&] { dims.load_links(link_files,data); });
+    dims.load(dim_files,data);
     event_files.folder(data/"events");
     click_files.folder(data/"clicks");
     fs::create_directories(out/"user_daily");
@@ -320,11 +323,8 @@ void run(const fs::path& data,const fs::path& out,int threads) {
         }
     });
     timer.lap("resolve potential duplicate IDs");
-    dimension_job.get();
-    timer.lap("await dimensions");
     auto finish=[&](auto representation) {
         using Event=decltype(representation);
-        std::vector<AliasCache> caches(threads);
         std::vector<Parts<Event>> events(threads);
         parallel(event_files.chunks.size(),threads,[&](size_t i,int worker) {
             const auto& skip=discarded[i];
@@ -334,7 +334,7 @@ void run(const fs::path& data,const fs::path& out,int threads) {
                 if(skip[row/64] & (uint64_t(1)<<(row%64))) return;
                 std::array<Text,7> f;
                 if(!scan_fields(line,f) || f[0].empty()) return;
-                keep_event(f,dims,win,events[worker],caches[worker]);
+                keep_event(f,dims,win,events[worker]);
             });
         });
         timer.lap("parse and validate winners");
@@ -346,11 +346,38 @@ void run(const fs::path& data,const fs::path& out,int threads) {
                 I64 ts=timestamp(f[3]);
                 auto it=dims.campaign_ids.find(f[2]);
                 if(ts<win.start-week_ms || ts>=win.end || it==dims.campaign_ids.end()) return;
-                Person who=dims.people.lookup(f[1],caches[worker]);
+                Person who=dims.people.raw(f[1]);
                 clicks[worker][bucket(who)].push_back({who,ts,f[0],it->second});
             });
         });
         timer.lap("parse clicks");
+        link_job.get();
+        std::vector<Parts<Event>> canonical_events(threads);
+        std::vector<Parts<Click>> canonical_clicks(threads);
+        parallel(buckets,threads,[&](size_t b,int worker) {
+            OwnerGroups raw_groups;
+            std::vector<Person> owners;
+            auto resolve=[&](Person raw) {
+                unsigned group=raw_groups.intern(raw);
+                if(group==owners.size()) owners.push_back(dims.people.canonical(raw));
+                return owners[group];
+            };
+            auto route=[&](auto& sources,auto& dest) {
+                for(auto& part:sources) {
+                    for(auto& row:part[b]) {
+                        row.person=resolve(row.person);
+                        dest[bucket(row.person)].push_back(row);
+                    }
+                    using Buffer=std::decay_t<decltype(part[b])>;
+                    Buffer().swap(part[b]);
+                }
+            };
+            route(events,canonical_events[worker]);
+            route(clicks,canonical_clicks[worker]);
+        });
+        events.swap(canonical_events);
+        clicks.swap(canonical_clicks);
+        timer.lap("resolve distinct raw owners and route rows");
         std::vector<CampaignGrid> campaign_parts(threads);
         std::vector<DailyScratch> scratch;
         for(auto& part:campaign_parts) {

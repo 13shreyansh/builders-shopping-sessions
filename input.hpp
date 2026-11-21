@@ -418,10 +418,6 @@ struct ExtendedNames {
     }
     Text lookup(Person p) const { return shards[(p>>32)&63].names[uint32_t(p)]; }
 };
-struct AliasCache {
-    struct Entry { Text key; uint64_t hash=0; Person person{}; };
-    std::array<Entry,4096> slots{};
-};
 struct People {
     mutable ExtendedNames extended;
     NameIndex index;
@@ -454,21 +450,18 @@ struct People {
             membership[(e.hash>>6)&(words-1)] |= uint64_t(1)<<(e.hash&63);
         }
     }
-    Person standalone(Text s,uint64_t h) const {
-        uint64_t packed=pack_ascii(s);
-        return packed ? packed : extended.intern(s,h);
+    Person raw(Text key) const {
+        if(Person code=pack_ascii(key)) return code;
+        return extended.intern(key,text_hash(key));
     }
-    Person lookup(Text s,AliasCache& cache) const {
-        uint64_t h=text_hash(s);
-        if(!(membership[(h>>6)&(membership.size()-1)] & (uint64_t(1)<<(h&63))))
-            return standalone(s,h);
-        auto& cached=cache.slots[(h^(h>>32))&(cache.slots.size()-1)];
-        if(cached.hash==h && cached.key==s) return cached.person;
-        const auto& e=index.slots[index.locate(s,h)];
-        if(e.key.empty()) return standalone(s,h);
-        Person result=linked_tag|static_cast<unsigned>(e.value);
-        cached={s,h,result};
-        return result;
+    Person canonical(Person raw_code) const {
+        std::array<char,9> temporary;
+        Text key=name(raw_code,temporary);
+        uint64_t hash=text_hash(key);
+        if(!(membership[(hash>>6)&(membership.size()-1)] & (uint64_t(1)<<(hash&63))))
+            return raw_code;
+        const auto& e=index.slots[index.locate(key,hash)];
+        return e.key.empty()?raw_code:linked_tag|static_cast<unsigned>(e.value);
     }
     Text name(Person p,std::array<char,9>& buf) const {
         if((p&extended_tag)==extended_tag) return extended.lookup(p);

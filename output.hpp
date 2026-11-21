@@ -61,7 +61,7 @@ inline std::shared_ptr<parquet::schema::GroupNode> user_schema() {
 inline void write_users(const fs::path& path,const std::vector<UserRow>& rows,const People& people) {
     using namespace parquet;
     auto sink=take(::arrow::io::FileOutputStream::Open(path.string()));
-    static const auto properties=WriterProperties::Builder().disable_statistics()->disable_dictionary()->build();
+    static const auto properties=WriterProperties::Builder().disable_statistics()->disable_dictionary()->compression(Compression::LZ4)->build();
     auto writer=ParquetFileWriter::Open(sink,user_schema(),properties);
     for(size_t base=0;base<rows.size();base+=65536) {
         size_t n=std::min<size_t>(65536,rows.size()-base);
